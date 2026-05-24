@@ -1,0 +1,4 @@
+main
+main-arm64
+main-stripped
+*.exe
