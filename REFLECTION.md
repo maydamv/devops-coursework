@@ -28,9 +28,12 @@ are themselves describable as code, versioned alongside `main.go`.
 
 ## What's still unclear?
 
-I built `main-arm64` and `main-stripped` to satisfy the stretch checks
-but didn't actually inspect them — I never ran `file ./main-arm64` to
-confirm the architecture, or `du -b` to measure how much smaller
-stripping really makes a binary. I trusted the auto-tick and moved on.
-The stretch is only meaningful if I know what I produced, not just
-that a file with the right name exists.
+What I still don't fully get is the SSH side of Jenkins. The
+credentials plugin, private key vs passphrase, how agents authenticate,
+it all kind of blurs together for me.
+
+I asked the agent why everyone references credentials by ID in the
+Jenkinsfile instead of pasting the secret directly. The thing I didn't
+realise: Jenkins only hides secrets in the build log when they come
+through the credentials plugin. If you write them as plain strings
+they just show up in the log for anyone with build access.
