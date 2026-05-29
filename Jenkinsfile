@@ -1,20 +1,21 @@
 // Jenkinsfile — first-deployment-pipeline (CS411)
 //
-// Three stages: build the Go binary on the Jenkins node, copy it to the
-// target machine over SSH, and start it there. Adjust the env block to
-// match the playground (target host, SSH user, credential ID) once you
-// see those values in Jenkins.
+// Build the Go binary on the Jenkins node, ship it to the target machine
+// over SSH, install it as a systemd service (so it survives the SSH session
+// that started it), and gate the build on a real health check.
 
 pipeline {
     agent any
 
     environment {
-        APP_NAME       = 'main'
-        APP_PORT       = '4444'
-        TARGET_HOST    = 'target'          // TODO confirm hostname in iximiuz
-        TARGET_USER    = 'root'            // TODO confirm SSH user in iximiuz
-        TARGET_PATH    = '/usr/local/bin/main'
-        SSH_CRED_ID    = 'target-ssh'      // TODO confirm credential ID in Jenkins
+        APP_NAME    = 'main'
+        APP_PORT    = '4444'
+        TARGET_HOST = 'target'
+        TARGET_USER = 'laborant'
+        TARGET_PATH = '/usr/local/bin/main'
+        SVC_NAME    = 'myapp'
+        SSH_CRED_ID = 'target-ssh'
+        SSH_OPTS    = '-o StrictHostKeyChecking=no'
     }
 
     stages {
@@ -31,25 +32,54 @@ pipeline {
             steps {
                 sshagent(credentials: [SSH_CRED_ID]) {
                     sh '''
-                        scp -o StrictHostKeyChecking=no \
-                            ${APP_NAME} ${TARGET_USER}@${TARGET_HOST}:${TARGET_PATH}
-                        ssh -o StrictHostKeyChecking=no \
-                            ${TARGET_USER}@${TARGET_HOST} "chmod +x ${TARGET_PATH}"
+                        scp ${SSH_OPTS} ${APP_NAME} ${TARGET_USER}@${TARGET_HOST}:/tmp/main
+                        scp ${SSH_OPTS} deploy/myapp.service ${TARGET_USER}@${TARGET_HOST}:/tmp/myapp.service
                     '''
                 }
             }
         }
 
-        stage('Run') {
+        stage('Deploy') {
             steps {
                 sshagent(credentials: [SSH_CRED_ID]) {
                     sh '''
-                        ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "
-                            pkill -f ${TARGET_PATH} || true
-                            nohup ${TARGET_PATH} > /var/log/myapp.log 2>&1 &
-                            sleep 1
-                            curl -fsS http://localhost:${APP_PORT}/
-                        "
+                        ssh ${SSH_OPTS} ${TARGET_USER}@${TARGET_HOST} '
+                            set -e
+                            # dedicated non-root service account (idempotent)
+                            id myapp >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp
+
+                            # install the binary atomically (install replaces in one move,
+                            # so a re-run never trips over a half-copied or busy file)
+                            sudo install -m 0755 /tmp/main /usr/local/bin/main
+
+                            # install/refresh the unit and (re)start through systemd
+                            sudo install -m 0644 /tmp/myapp.service /etc/systemd/system/myapp.service
+                            sudo systemctl daemon-reload
+                            sudo systemctl enable myapp
+                            sudo systemctl restart myapp
+                        '
+                    '''
+                }
+            }
+        }
+
+        stage('Health check') {
+            steps {
+                sshagent(credentials: [SSH_CRED_ID]) {
+                    sh '''
+                        ssh ${SSH_OPTS} ${TARGET_USER}@${TARGET_HOST} '
+                            for i in $(seq 1 10); do
+                                if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
+                                    echo "App is serving traffic on port '${APP_PORT}'"
+                                    exit 0
+                                fi
+                                echo "waiting for app... ($i/10)"
+                                sleep 1
+                            done
+                            echo "App did not become healthy in time"
+                            sudo journalctl -u myapp --no-pager -n 30
+                            exit 1
+                        '
                     '''
                 }
             }
@@ -57,7 +87,7 @@ pipeline {
     }
 
     post {
-        success { echo "Deployed ${APP_NAME} to ${TARGET_HOST}:${APP_PORT}" }
+        success { echo "Deployed ${SVC_NAME} to ${TARGET_HOST}:${APP_PORT} via systemd" }
         failure { echo "Build failed — check the stage logs above" }
     }
 }
