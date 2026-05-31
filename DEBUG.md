@@ -1,55 +1,57 @@
-# Debug — app unreachable after the pipeline goes green
+# Debug — `exec format error` running the pushed image on x86_64
 
-**Scenario.** The pipeline is green and the "Copy + run on target" stage
-logs say it succeeded. From my laptop, `curl <target>:4444` returns
-`Connection refused`. I SSH into target, run `./main` in the foreground —
-it works, and `curl localhost:4444` returns the JSON. The moment I `exit`
-the SSH session, the app dies. The next pipeline run behaves the same way.
+**Scenario.** I built the image on an Apple Silicon Mac with a plain
+`docker build -t ttl.sh/<name>:2h .` and pushed it. Build green, push
+green, and on the x86_64 `docker` VM the manifest pulls fine. But
+`docker run …` prints:
+
+```
+exec /app/main: exec format error
+```
+
+The container starts and dies immediately on that one line.
 
 ## Hypotheses (ranked)
 
-1. **The app was started as a child of the SSH session, so it dies on
-   logout (SIGHUP).** A run step like `ssh target './main &'` leaves the
-   process in that session's process group; when the connection closes the
-   kernel sends SIGHUP and the app exits. This is the strongest fit — the
-   app provably lives only as long as the session, which is the one symptom
-   the scenario states outright.
-2. **The app binds to `127.0.0.1` instead of all interfaces.** If it
-   listened on loopback only, `curl localhost:4444` on target would work
-   while `curl <target>:4444` from the laptop got `Connection refused` —
-   even with the process perfectly alive. This explains the remote refusal
-   without invoking process death, so it has to be ruled out separately.
+1. **The image was built for `linux/arm64`.** A plain `docker build` on
+   Apple Silicon stamps the builder's native architecture into the image
+   config *and* compiles an arm64 Go binary inside it. An x86_64 kernel
+   can't exec an aarch64 ELF, so the process dies the instant it starts —
+   which is exactly "starts, then `exec format error`".
+2. **The image config says amd64 but the binary inside is arm64.** "The
+   image" carries arch in two independent places — the config/manifest
+   metadata and the actual ELF bytes of `/app/main`. If `GOARCH` was set
+   to arm64 while the base/platform stayed amd64, the manifest would look
+   right while the binary still refuses to exec.
 
 ## Verification
 
-1. Right after a pipeline run (no interactive session open), check whether
-   anything is alive: `ssh target 'pgrep -af main'`. An empty result means
-   the process did not survive the run — confirms hypothesis 1.
-2. While the app is running, inspect what address it's bound to:
-   `ssh target 'ss -ltnp | grep :4444'`. `127.0.0.1:4444` points to
-   hypothesis 2 (loopback-only); `0.0.0.0:4444` or `*:4444` clears the
-   binding and sends you back to hypothesis 1.
+1. Ask what architecture the image declares:
+   `docker image inspect ttl.sh/<name>:2h --format '{{.Architecture}}'`
+   (or `docker manifest inspect` against the registry). `arm64` confirms
+   hypothesis 1.
+2. Pull the binary out and look at the ELF itself (scratch has no shell to
+   run `file` inside): `docker create --name x ttl.sh/<name>:2h &&
+   docker cp x:/app/main ./main && file ./main`. `ARM aarch64` vs
+   `x86-64` tells you whether the *binary* disagrees with the manifest
+   (hypothesis 2) or matches it (hypothesis 1).
 
 ## Fix
 
-Hypothesis 1 is the real cause, so stop starting the binary inside the SSH
-session and let `systemd` own it:
+Build for the architecture the deploy host actually runs. With buildx,
+target the host platform explicitly and push in one step:
 
 ```
-sudo install -m 0644 myapp.service /etc/systemd/system/myapp.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now myapp
+docker buildx build --platform linux/amd64 -t ttl.sh/<name>:2h --push .
 ```
 
-systemd starts the process in its own cgroup, detached from any login
-session, so closing SSH no longer touches it, and `Restart=on-failure`
-brings it back if it crashes. (If verification had pointed at hypothesis 2
-instead, the minimal fix is binding the server to `:4444` / `0.0.0.0`
-rather than `127.0.0.1` — which the Go source already does.)
+(Equivalently, force the compiler with `GOARCH=amd64 CGO_ENABLED=0 GOOS=linux
+go build` in the build stage.) Building multi-arch
+`--platform linux/amd64,linux/arm64` makes the image run on either host.
 
 ## Lesson
 
-"Process exists right now" means something you launched is running this
-instant, still tethered to the terminal that started it; "process is
-supervised" means an init system owns it independently of any session and
-keeps it alive — and only the second one is what "deployed" should mean.
+"The image is built" only promises it runs on a host of the **same CPU
+architecture (and OS)** it was built for — a container image is
+arch-specific bytes, not a magically portable artifact, unless you
+deliberately build a multi-arch manifest.

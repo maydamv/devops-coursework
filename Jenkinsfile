@@ -1,64 +1,43 @@
-// Jenkinsfile — first-deployment-pipeline (CS411)
+// Jenkinsfile — docker-build-deploy (CS411)
 //
-// Build the Go binary on the Jenkins node, ship it to the target machine
-// over SSH, install it as a systemd service (so it survives the SSH session
-// that started it), and gate the build on a real health check.
-//
-// Uses withCredentials + sshUserPrivateKey (the SSH Agent plugin is not
-// installed on this Jenkins), which hands us a temporary private-key file.
+// Build a Docker image from the repo on the Jenkins node, push it to the
+// anonymous ttl.sh registry, then on the docker VM pull the image and run
+// a container exposing :4444. A health check gates the build on the
+// container actually serving traffic.
 
 pipeline {
     agent any
 
     environment {
-        APP_NAME    = 'main'
+        IMAGE       = 'ttl.sh/maydamv-cs411-devops:2h'
         APP_PORT    = '4444'
-        TARGET_HOST = 'target'
-        TARGET_PATH = '/usr/local/bin/main'
-        SVC_NAME    = 'myapp'
+        DOCKER_VM   = 'docker'
         SSH_CRED_ID = 'target-ssh'
         SSH_OPTS    = '-o StrictHostKeyChecking=no'
     }
 
     stages {
 
-        stage('Build') {
+        stage('Build image') {
             steps {
-                sh 'go version'
-                sh 'go build -o ${APP_NAME} main.go'
-                sh 'ls -la ${APP_NAME}'
+                sh 'docker build -t ${IMAGE} .'
             }
         }
 
-        stage('Ship') {
+        stage('Push') {
             steps {
-                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
-                    sh '''
-                        scp ${SSH_OPTS} -i "$SSH_KEY" main "$SSH_USER"@${TARGET_HOST}:/tmp/main
-                        scp ${SSH_OPTS} -i "$SSH_KEY" deploy/myapp.service "$SSH_USER"@${TARGET_HOST}:/tmp/myapp.service
-                    '''
-                }
+                sh 'docker push ${IMAGE}'
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy on docker VM') {
             steps {
                 withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${TARGET_HOST} '
-                            set -e
-                            # dedicated non-root service account (idempotent)
-                            id myapp >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp
-
-                            # install the binary atomically (install replaces in one move,
-                            # so a re-run never trips over a half-copied or busy file)
-                            sudo install -m 0755 /tmp/main /usr/local/bin/main
-
-                            # install/refresh the unit and (re)start through systemd
-                            sudo install -m 0644 /tmp/myapp.service /etc/systemd/system/myapp.service
-                            sudo systemctl daemon-reload
-                            sudo systemctl enable myapp
-                            sudo systemctl restart myapp
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
+                            docker pull '${IMAGE}'
+                            docker rm -f myapp 2>/dev/null || true
+                            docker run -d --name myapp -p '${APP_PORT}':'${APP_PORT}' '${IMAGE}'
                         '
                     '''
                 }
@@ -69,17 +48,17 @@ pipeline {
             steps {
                 withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${TARGET_HOST} '
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
                             for i in $(seq 1 10); do
                                 if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
-                                    echo "App is serving traffic on port '${APP_PORT}'"
+                                    echo "Container is serving traffic on port '${APP_PORT}'"
                                     exit 0
                                 fi
-                                echo "waiting for app... ($i/10)"
+                                echo "waiting for container... ($i/10)"
                                 sleep 1
                             done
-                            echo "App did not become healthy in time"
-                            sudo journalctl -u myapp --no-pager -n 30
+                            echo "Container did not become healthy in time"
+                            docker logs myapp || true
                             exit 1
                         '
                     '''
@@ -89,7 +68,7 @@ pipeline {
     }
 
     post {
-        success { echo "Deployed ${SVC_NAME} to ${TARGET_HOST}:${APP_PORT} via systemd" }
+        success { echo "Deployed ${IMAGE} to ${DOCKER_VM}:${APP_PORT}" }
         failure { echo "Build failed — check the stage logs above" }
     }
 }
