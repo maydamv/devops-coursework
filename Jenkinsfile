@@ -3,6 +3,9 @@
 // Build the Go binary on the Jenkins node, ship it to the target machine
 // over SSH, install it as a systemd service (so it survives the SSH session
 // that started it), and gate the build on a real health check.
+//
+// Uses withCredentials + sshUserPrivateKey (the SSH Agent plugin is not
+// installed on this Jenkins), which hands us a temporary private-key file.
 
 pipeline {
     agent any
@@ -11,7 +14,6 @@ pipeline {
         APP_NAME    = 'main'
         APP_PORT    = '4444'
         TARGET_HOST = 'target'
-        TARGET_USER = 'laborant'
         TARGET_PATH = '/usr/local/bin/main'
         SVC_NAME    = 'myapp'
         SSH_CRED_ID = 'target-ssh'
@@ -30,10 +32,10 @@ pipeline {
 
         stage('Ship') {
             steps {
-                sshagent(credentials: [SSH_CRED_ID]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        scp ${SSH_OPTS} ${APP_NAME} ${TARGET_USER}@${TARGET_HOST}:/tmp/main
-                        scp ${SSH_OPTS} deploy/myapp.service ${TARGET_USER}@${TARGET_HOST}:/tmp/myapp.service
+                        scp ${SSH_OPTS} -i "$SSH_KEY" main "$SSH_USER"@${TARGET_HOST}:/tmp/main
+                        scp ${SSH_OPTS} -i "$SSH_KEY" deploy/myapp.service "$SSH_USER"@${TARGET_HOST}:/tmp/myapp.service
                     '''
                 }
             }
@@ -41,9 +43,9 @@ pipeline {
 
         stage('Deploy') {
             steps {
-                sshagent(credentials: [SSH_CRED_ID]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        ssh ${SSH_OPTS} ${TARGET_USER}@${TARGET_HOST} '
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${TARGET_HOST} '
                             set -e
                             # dedicated non-root service account (idempotent)
                             id myapp >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp
@@ -65,9 +67,9 @@ pipeline {
 
         stage('Health check') {
             steps {
-                sshagent(credentials: [SSH_CRED_ID]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        ssh ${SSH_OPTS} ${TARGET_USER}@${TARGET_HOST} '
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${TARGET_HOST} '
                             for i in $(seq 1 10); do
                                 if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
                                     echo "App is serving traffic on port '${APP_PORT}'"
