@@ -1,49 +1,55 @@
-# Debug — GLIBC mismatch on Ubuntu 18.04
+# Debug — app unreachable after the pipeline goes green
 
-**Error**
-
-```
-./main: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by ./main)
-```
+**Scenario.** The pipeline is green and the "Copy + run on target" stage
+logs say it succeeded. From my laptop, `curl <target>:4444` returns
+`Connection refused`. I SSH into target, run `./main` in the foreground —
+it works, and `curl localhost:4444` returns the JSON. The moment I `exit`
+the SSH session, the app dies. The next pipeline run behaves the same way.
 
 ## Hypotheses (ranked)
 
-1. **Build host has a newer GLIBC than the target.** The Jenkins machine runs
-   a recent Ubuntu (22.04+, GLIBC 2.35+), so its `libc.so.6` exports
-   `GLIBC_2.34`. Ubuntu 18.04 ships GLIBC 2.27, which doesn't. The binary was
-   linked against symbols that simply don't exist on the customer's VM.
-2. **The binary is dynamically linked through cgo when it didn't need to be.**
-   Go's `net` package uses cgo for DNS resolution by default on Linux, which
-   drags in libc. A pure-Go build wouldn't depend on the host's libc at all
-   and wouldn't care which Ubuntu it runs on.
+1. **The app was started as a child of the SSH session, so it dies on
+   logout (SIGHUP).** A run step like `ssh target './main &'` leaves the
+   process in that session's process group; when the connection closes the
+   kernel sends SIGHUP and the app exits. This is the strongest fit — the
+   app provably lives only as long as the session, which is the one symptom
+   the scenario states outright.
+2. **The app binds to `127.0.0.1` instead of all interfaces.** If it
+   listened on loopback only, `curl localhost:4444` on target would work
+   while `curl <target>:4444` from the laptop got `Connection refused` —
+   even with the process perfectly alive. This explains the remote refusal
+   without invoking process death, so it has to be ruled out separately.
 
 ## Verification
 
-1. On the customer VM, run `ldd --version` (expect 2.27 on Ubuntu 18.04).
-   On the build host, run `ldd --version` (expect 2.35+). If the gap straddles
-   2.34, hypothesis 1 is confirmed.
-2. On the build host, run `file ./main` and `ldd ./main`. If the output says
-   "dynamically linked" and lists `libc.so.6`, cgo is in play and hypothesis 2
-   is the real lever — rebuilding without cgo will remove the dependency
-   entirely, regardless of which GLIBC the build host has.
+1. Right after a pipeline run (no interactive session open), check whether
+   anything is alive: `ssh target 'pgrep -af main'`. An empty result means
+   the process did not survive the run — confirms hypothesis 1.
+2. While the app is running, inspect what address it's bound to:
+   `ssh target 'ss -ltnp | grep :4444'`. `127.0.0.1:4444` points to
+   hypothesis 2 (loopback-only); `0.0.0.0:4444` or `*:4444` clears the
+   binding and sends you back to hypothesis 1.
 
 ## Fix
 
-Rebuild with cgo disabled so the binary doesn't link against the host's libc
-at all:
+Hypothesis 1 is the real cause, so stop starting the binary inside the SSH
+session and let `systemd` own it:
 
 ```
-CGO_ENABLED=0 go build -o main main.go
+sudo install -m 0644 myapp.service /etc/systemd/system/myapp.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now myapp
 ```
 
-`ldd ./main` should now print `not a dynamic executable`. The binary then
-runs on Ubuntu 18.04, 20.04, Alpine, or anything with a Linux kernel — no
-libc required, no GLIBC version to match.
+systemd starts the process in its own cgroup, detached from any login
+session, so closing SSH no longer touches it, and `Restart=on-failure`
+brings it back if it crashes. (If verification had pointed at hypothesis 2
+instead, the minimal fix is binding the server to `:4444` / `0.0.0.0`
+rather than `127.0.0.1` — which the Go source already does.)
 
 ## Lesson
 
-A Go binary is only as portable as its weakest dynamic dependency: by default
-`net` pulls in cgo, which links against the build host's libc and silently
-inherits its minimum GLIBC version. Ship with `CGO_ENABLED=0` (or build
-inside a container whose libc matches the oldest target distro) whenever the
-binary leaves the machine that built it.
+"Process exists right now" means something you launched is running this
+instant, still tethered to the terminal that started it; "process is
+supervised" means an init system owns it independently of any session and
+keeps it alive — and only the second one is what "deployed" should mean.
