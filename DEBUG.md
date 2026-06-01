@@ -1,57 +1,52 @@
-# Debug — `exec format error` running the pushed image on x86_64
+# Debug — Pod stuck in ImagePullBackOff
 
-**Scenario.** I built the image on an Apple Silicon Mac with a plain
-`docker build -t ttl.sh/<name>:2h .` and pushed it. Build green, push
-green, and on the x86_64 `docker` VM the manifest pulls fine. But
-`docker run …` prints:
-
-```
-exec /app/main: exec format error
-```
-
-The container starts and dies immediately on that one line.
+**Scenario.** The pipeline pushes the image to `ttl.sh` and applies the Pod
+manifest. `kubectl get pods` shows `ImagePullBackOff`. The `image:` field in
+the manifest matches the tag the pipeline pushed, and on the Jenkins machine
+`docker pull <image>` succeeds.
 
 ## Hypotheses (ranked)
 
-1. **The image was built for `linux/arm64`.** A plain `docker build` on
-   Apple Silicon stamps the builder's native architecture into the image
-   config *and* compiles an arm64 Go binary inside it. An x86_64 kernel
-   can't exec an aarch64 ELF, so the process dies the instant it starts —
-   which is exactly "starts, then `exec format error`".
-2. **The image config says amd64 but the binary inside is arm64.** "The
-   image" carries arch in two independent places — the config/manifest
-   metadata and the actual ELF bytes of `/app/main`. If `GOARCH` was set
-   to arm64 while the base/platform stayed amd64, the manifest would look
-   right while the binary still refuses to exec.
+1. **The ttl.sh tag expired before the kubelet pulled it.** `ttl.sh/...:2h`
+   lives for ~2 hours; Jenkins `docker pull` succeeds because the image is
+   still in Jenkins' *local* cache from the build, but the kubelet on the
+   node has no cache and must fetch from ttl.sh — where, after the TTL, the
+   tag is gone. The puller and its environment are different.
+2. **The cluster node can't reach ttl.sh even though Jenkins can.** The
+   kubelet pulls using the node's own network egress/DNS; if the node has no
+   route to `ttl.sh` (or no DNS for it) the pull fails with a network error
+   while Jenkins, on a different host with egress, pulls fine.
 
 ## Verification
 
-1. Ask what architecture the image declares:
-   `docker image inspect ttl.sh/<name>:2h --format '{{.Architecture}}'`
-   (or `docker manifest inspect` against the registry). `arm64` confirms
-   hypothesis 1.
-2. Pull the binary out and look at the ELF itself (scratch has no shell to
-   run `file` inside): `docker create --name x ttl.sh/<name>:2h &&
-   docker cp x:/app/main ./main && file ./main`. `ARM aarch64` vs
-   `x86-64` tells you whether the *binary* disagrees with the manifest
-   (hypothesis 2) or matches it (hypothesis 1).
+1. `kubectl describe pod myapp` and read the Events. A pull error like
+   `manifest unknown` / `not found` / HTTP 404 points to hypothesis 1 (the
+   tag is gone). A `dial tcp: i/o timeout` or `no such host` points to
+   hypothesis 2 (the node can't reach the registry).
+2. Reproduce the pull from the node's runtime, not from Jenkins:
+   `crictl pull ttl.sh/maydamv-cs411-devops:2h` on the node (or via a debug
+   pod). If it 404s, the image is expired (1); if it times out, it's egress
+   (2).
 
 ## Fix
 
-Build for the architecture the deploy host actually runs. With buildx,
-target the host platform explicitly and push in one step:
+Hypothesis 1 is the usual cause with `ttl.sh`. Push a fresh image
+immediately before applying and force the kubelet to fetch it:
 
 ```
-docker buildx build --platform linux/amd64 -t ttl.sh/<name>:2h --push .
+docker push ttl.sh/maydamv-cs411-devops:2h   # fresh, in the same pipeline run
+# manifest:
+imagePullPolicy: Always
 ```
 
-(Equivalently, force the compiler with `GOARCH=amd64 CGO_ENABLED=0 GOOS=linux
-go build` in the build stage.) Building multi-arch
-`--platform linux/amd64,linux/arm64` makes the image run on either host.
+So the node pulls the just-pushed image instead of relying on anything
+cached. (If verification showed a *private* registry instead, the minimal
+fix is `imagePullSecrets` on the Pod; if it showed a stale tag in the
+manifest, correct the tag.)
 
 ## Lesson
 
-"The image is built" only promises it runs on a host of the **same CPU
-architecture (and OS)** it was built for — a container image is
-arch-specific bytes, not a magically portable artifact, unless you
-deliberately build a multi-arch manifest.
+"I can pull this image" means *my* host, with *my* network and possibly a
+warm local cache, can fetch it right now; "the cluster can pull this image"
+means every node's kubelet can fetch it fresh, with the node's own network
+and credentials — and only the second one is what a Pod actually depends on.
