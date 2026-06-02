@@ -17,7 +17,13 @@ provider "aws" {
 variable "region" {
   description = "AWS region"
   type        = string
-  default     = "us-east-1"
+  default     = "eu-north-1"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type (free-tier: t3.micro in eu-north-1, t2.micro elsewhere)"
+  type        = string
+  default     = "t3.micro"
 }
 
 variable "public_key_path" {
@@ -56,7 +62,7 @@ data "aws_ami" "ubuntu" {
 # ---------------------------------------------------------------------------
 resource "aws_key_pair" "cs411" {
   key_name   = "cs411-ec2"
-  public_key = file(var.public_key_path)
+  public_key = file(pathexpand(var.public_key_path))
 }
 
 # ---------------------------------------------------------------------------
@@ -100,7 +106,7 @@ resource "aws_security_group" "myapp" {
 # ---------------------------------------------------------------------------
 resource "aws_instance" "myapp" {
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t2.micro"
+  instance_type          = var.instance_type
   key_name               = aws_key_pair.cs411.key_name
   vpc_security_group_ids = [aws_security_group.myapp.id]
 
