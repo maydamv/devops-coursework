@@ -2,3 +2,14 @@ main
 main-arm64
 main-stripped
 *.exe
+
+# Terraform — never commit state (may contain secrets) or local provider cache
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+
+# SSH keys — never commit private keys
+*.pem
+*.key

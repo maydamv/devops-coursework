@@ -1,51 +1,86 @@
-// Jenkinsfile — deploy-to-kubernetes (CS411)
+// Jenkinsfile — deployment-to-cloud (CS411)
 //
-// Build + push the image (ttl.sh), then authenticate to the cluster API
-// with a ServiceAccount bearer token and apply the Pod (+ Service) manifest.
-// The image is rebuilt/pushed every run because ttl.sh tags are short-lived.
+// Build the Go binary on the Jenkins node, ship it to a real AWS EC2
+// instance over SSH, and run it under systemd (same shape as
+// first-deployment-pipeline, different target host).
+//
+// EC2_IP and EC2_USER are build parameters so the public IP never gets
+// committed and the AMI's login user can vary (ubuntu / ec2-user).
+// The .pem private key lives in the 'ec2-ssh' Jenkins credential.
 
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'EC2_IP',   defaultValue: '',       description: 'Public IP of the EC2 instance')
+        string(name: 'EC2_USER', defaultValue: 'ubuntu', description: 'SSH login user (ubuntu for Ubuntu AMI, ec2-user for Amazon Linux)')
+    }
+
     environment {
-        IMAGE      = 'ttl.sh/maydamv-cs411-devops:2h'
-        K8S_API    = 'https://kubernetes:6443'
-        K8S_TOKEN_ID = 'k8s-token'
-        // shared kubectl connection flags (token added per-call from creds)
-        KUBE_ARGS  = '--server=https://kubernetes:6443 --insecure-skip-tls-verify=true'
+        APP_NAME    = 'main'
+        APP_PORT    = '4444'
+        TARGET_PATH = '/usr/local/bin/main'
+        SVC_NAME    = 'myapp'
+        SSH_CRED_ID = 'ec2-ssh'
+        SSH_OPTS    = '-o StrictHostKeyChecking=no'
     }
 
     stages {
 
-        stage('Build image') {
+        stage('Build') {
             steps {
-                sh 'docker build -t ${IMAGE} .'
+                sh 'go version'
+                sh 'go build -o ${APP_NAME} main.go'
+                sh 'ls -la ${APP_NAME}'
             }
         }
 
-        stage('Push') {
+        stage('Ship') {
             steps {
-                sh 'docker push ${IMAGE}'
-            }
-        }
-
-        stage('Deploy to Kubernetes') {
-            steps {
-                withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY')]) {
                     sh '''
-                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" apply -f k8s/myapp-pod.yaml
-                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" apply -f k8s/myapp-service.yaml
+                        scp ${SSH_OPTS} -i "$SSH_KEY" ${APP_NAME} ${EC2_USER}@${EC2_IP}:/tmp/main
+                        scp ${SSH_OPTS} -i "$SSH_KEY" deploy/myapp.service ${EC2_USER}@${EC2_IP}:/tmp/myapp.service
                     '''
                 }
             }
         }
 
-        stage('Wait for Ready') {
+        stage('Deploy') {
             steps {
-                withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY')]) {
                     sh '''
-                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" wait --for=condition=Ready pod/myapp --timeout=90s
-                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" get pod myapp -o wide
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" ${EC2_USER}@${EC2_IP} '
+                            set -e
+                            id myapp >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp
+                            sudo install -m 0755 /tmp/main /usr/local/bin/main
+                            sudo install -m 0644 /tmp/myapp.service /etc/systemd/system/myapp.service
+                            sudo systemctl daemon-reload
+                            sudo systemctl enable myapp
+                            sudo systemctl restart myapp
+                        '
+                    '''
+                }
+            }
+        }
+
+        stage('Health check') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY')]) {
+                    sh '''
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" ${EC2_USER}@${EC2_IP} '
+                            for i in $(seq 1 10); do
+                                if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
+                                    echo "App is serving traffic on '${APP_PORT}' (locally on the instance)"
+                                    exit 0
+                                fi
+                                echo "waiting for app... ($i/10)"
+                                sleep 1
+                            done
+                            echo "App did not become healthy in time"
+                            sudo journalctl -u myapp --no-pager -n 30
+                            exit 1
+                        '
                     '''
                 }
             }
@@ -53,13 +88,7 @@ pipeline {
     }
 
     post {
-        success { echo "Pod myapp is Running and serving on :4444" }
-        failure {
-            withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
-                sh '''
-                    kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" describe pod myapp || true
-                '''
-            }
-        }
+        success { echo "Deployed ${SVC_NAME} to EC2 ${EC2_IP}:${APP_PORT} — now paste that IP into iximiuz" }
+        failure { echo "Build failed — check the stage logs above" }
     }
 }
