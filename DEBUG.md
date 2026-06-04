@@ -1,49 +1,57 @@
-# Debug — GLIBC mismatch on Ubuntu 18.04
+# Debug — `exec format error` running the pushed image on x86_64
 
-**Error**
+**Scenario.** I built the image on an Apple Silicon Mac with a plain
+`docker build -t ttl.sh/<name>:2h .` and pushed it. Build green, push
+green, and on the x86_64 `docker` VM the manifest pulls fine. But
+`docker run …` prints:
 
 ```
-./main: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by ./main)
+exec /app/main: exec format error
 ```
+
+The container starts and dies immediately on that one line.
 
 ## Hypotheses (ranked)
 
-1. **Build host has a newer GLIBC than the target.** The Jenkins machine runs
-   a recent Ubuntu (22.04+, GLIBC 2.35+), so its `libc.so.6` exports
-   `GLIBC_2.34`. Ubuntu 18.04 ships GLIBC 2.27, which doesn't. The binary was
-   linked against symbols that simply don't exist on the customer's VM.
-2. **The binary is dynamically linked through cgo when it didn't need to be.**
-   Go's `net` package uses cgo for DNS resolution by default on Linux, which
-   drags in libc. A pure-Go build wouldn't depend on the host's libc at all
-   and wouldn't care which Ubuntu it runs on.
+1. **The image was built for `linux/arm64`.** A plain `docker build` on
+   Apple Silicon stamps the builder's native architecture into the image
+   config *and* compiles an arm64 Go binary inside it. An x86_64 kernel
+   can't exec an aarch64 ELF, so the process dies the instant it starts —
+   which is exactly "starts, then `exec format error`".
+2. **The image config says amd64 but the binary inside is arm64.** "The
+   image" carries arch in two independent places — the config/manifest
+   metadata and the actual ELF bytes of `/app/main`. If `GOARCH` was set
+   to arm64 while the base/platform stayed amd64, the manifest would look
+   right while the binary still refuses to exec.
 
 ## Verification
 
-1. On the customer VM, run `ldd --version` (expect 2.27 on Ubuntu 18.04).
-   On the build host, run `ldd --version` (expect 2.35+). If the gap straddles
-   2.34, hypothesis 1 is confirmed.
-2. On the build host, run `file ./main` and `ldd ./main`. If the output says
-   "dynamically linked" and lists `libc.so.6`, cgo is in play and hypothesis 2
-   is the real lever — rebuilding without cgo will remove the dependency
-   entirely, regardless of which GLIBC the build host has.
+1. Ask what architecture the image declares:
+   `docker image inspect ttl.sh/<name>:2h --format '{{.Architecture}}'`
+   (or `docker manifest inspect` against the registry). `arm64` confirms
+   hypothesis 1.
+2. Pull the binary out and look at the ELF itself (scratch has no shell to
+   run `file` inside): `docker create --name x ttl.sh/<name>:2h &&
+   docker cp x:/app/main ./main && file ./main`. `ARM aarch64` vs
+   `x86-64` tells you whether the *binary* disagrees with the manifest
+   (hypothesis 2) or matches it (hypothesis 1).
 
 ## Fix
 
-Rebuild with cgo disabled so the binary doesn't link against the host's libc
-at all:
+Build for the architecture the deploy host actually runs. With buildx,
+target the host platform explicitly and push in one step:
 
 ```
-CGO_ENABLED=0 go build -o main main.go
+docker buildx build --platform linux/amd64 -t ttl.sh/<name>:2h --push .
 ```
 
-`ldd ./main` should now print `not a dynamic executable`. The binary then
-runs on Ubuntu 18.04, 20.04, Alpine, or anything with a Linux kernel — no
-libc required, no GLIBC version to match.
+(Equivalently, force the compiler with `GOARCH=amd64 CGO_ENABLED=0 GOOS=linux
+go build` in the build stage.) Building multi-arch
+`--platform linux/amd64,linux/arm64` makes the image run on either host.
 
 ## Lesson
 
-A Go binary is only as portable as its weakest dynamic dependency: by default
-`net` pulls in cgo, which links against the build host's libc and silently
-inherits its minimum GLIBC version. Ship with `CGO_ENABLED=0` (or build
-inside a container whose libc matches the oldest target distro) whenever the
-binary leaves the machine that built it.
+"The image is built" only promises it runs on a host of the **same CPU
+architecture (and OS)** it was built for — a container image is
+arch-specific bytes, not a magically portable artifact, unless you
+deliberately build a multi-arch manifest.

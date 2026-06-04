@@ -1,0 +1,13 @@
+[Unit]
+Description=Simple Go HTTP server (CS411 first-deployment-pipeline)
+After=network.target
+
+[Service]
+Type=simple
+User=myapp
+ExecStart=/usr/local/bin/main
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

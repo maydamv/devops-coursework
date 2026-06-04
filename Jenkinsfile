@@ -1,55 +1,66 @@
-// Jenkinsfile — first-deployment-pipeline (CS411)
+// Jenkinsfile — docker-build-deploy (CS411)
 //
-// Three stages: build the Go binary on the Jenkins node, copy it to the
-// target machine over SSH, and start it there. Adjust the env block to
-// match the playground (target host, SSH user, credential ID) once you
-// see those values in Jenkins.
+// Build a Docker image from the repo on the Jenkins node, push it to the
+// anonymous ttl.sh registry, then on the docker VM pull the image and run
+// a container exposing :4444. A health check gates the build on the
+// container actually serving traffic.
 
 pipeline {
     agent any
 
     environment {
-        APP_NAME       = 'main'
-        APP_PORT       = '4444'
-        TARGET_HOST    = 'target'          // TODO confirm hostname in iximiuz
-        TARGET_USER    = 'root'            // TODO confirm SSH user in iximiuz
-        TARGET_PATH    = '/usr/local/bin/main'
-        SSH_CRED_ID    = 'target-ssh'      // TODO confirm credential ID in Jenkins
+        IMAGE       = 'ttl.sh/maydamv-cs411-devops:2h'
+        APP_PORT    = '4444'
+        DOCKER_VM   = 'docker'
+        SSH_CRED_ID = 'target-ssh'
+        SSH_OPTS    = '-o StrictHostKeyChecking=no'
     }
 
     stages {
 
-        stage('Build') {
+        stage('Build image') {
             steps {
-                sh 'go version'
-                sh 'go build -o ${APP_NAME} main.go'
-                sh 'ls -la ${APP_NAME}'
+                sh 'docker build -t ${IMAGE} .'
             }
         }
 
-        stage('Ship') {
+        stage('Push') {
             steps {
-                sshagent(credentials: [SSH_CRED_ID]) {
+                sh 'docker push ${IMAGE}'
+            }
+        }
+
+        stage('Deploy on docker VM') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        scp -o StrictHostKeyChecking=no \
-                            ${APP_NAME} ${TARGET_USER}@${TARGET_HOST}:${TARGET_PATH}
-                        ssh -o StrictHostKeyChecking=no \
-                            ${TARGET_USER}@${TARGET_HOST} "chmod +x ${TARGET_PATH}"
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
+                            docker pull '${IMAGE}'
+                            docker rm -f myapp 2>/dev/null || true
+                            docker run -d --name myapp -p '${APP_PORT}':'${APP_PORT}' '${IMAGE}'
+                        '
                     '''
                 }
             }
         }
 
-        stage('Run') {
+        stage('Health check') {
             steps {
-                sshagent(credentials: [SSH_CRED_ID]) {
+                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                     sh '''
-                        ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "
-                            pkill -f ${TARGET_PATH} || true
-                            nohup ${TARGET_PATH} > /var/log/myapp.log 2>&1 &
-                            sleep 1
-                            curl -fsS http://localhost:${APP_PORT}/
-                        "
+                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
+                            for i in $(seq 1 10); do
+                                if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
+                                    echo "Container is serving traffic on port '${APP_PORT}'"
+                                    exit 0
+                                fi
+                                echo "waiting for container... ($i/10)"
+                                sleep 1
+                            done
+                            echo "Container did not become healthy in time"
+                            docker logs myapp || true
+                            exit 1
+                        '
                     '''
                 }
             }
@@ -57,7 +68,7 @@ pipeline {
     }
 
     post {
-        success { echo "Deployed ${APP_NAME} to ${TARGET_HOST}:${APP_PORT}" }
+        success { echo "Deployed ${IMAGE} to ${DOCKER_VM}:${APP_PORT}" }
         failure { echo "Build failed — check the stage logs above" }
     }
 }
