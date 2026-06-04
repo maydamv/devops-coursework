@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+spec:
+  containers:
+    - name: myapp
+      image: ttl.sh/maydamv-cs411-devops:2h
+      # ttl.sh tags are mutable and short-lived; the pipeline pushes a fresh
+      # image right before applying, so always pull instead of using a cache.
+      imagePullPolicy: Always
+      ports:
+        - containerPort: 4444
+      # Liveness: restart the container if it stops responding.
+      # Readiness: keep it out of Service endpoints until it answers.
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 4444
+        initialDelaySeconds: 3
+        periodSeconds: 10
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 4444
+        initialDelaySeconds: 2
+        periodSeconds: 5
+      resources:
+        requests:
+          memory: "16Mi"
+          cpu: "50m"
+        limits:
+          memory: "64Mi"
+          cpu: "250m"

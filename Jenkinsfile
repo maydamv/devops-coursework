@@ -1,19 +1,18 @@
-// Jenkinsfile — docker-build-deploy (CS411)
+// Jenkinsfile — deploy-to-kubernetes (CS411)
 //
-// Build a Docker image from the repo on the Jenkins node, push it to the
-// anonymous ttl.sh registry, then on the docker VM pull the image and run
-// a container exposing :4444. A health check gates the build on the
-// container actually serving traffic.
+// Build + push the image (ttl.sh), then authenticate to the cluster API
+// with a ServiceAccount bearer token and apply the Pod (+ Service) manifest.
+// The image is rebuilt/pushed every run because ttl.sh tags are short-lived.
 
 pipeline {
     agent any
 
     environment {
-        IMAGE       = 'ttl.sh/maydamv-cs411-devops:2h'
-        APP_PORT    = '4444'
-        DOCKER_VM   = 'docker'
-        SSH_CRED_ID = 'target-ssh'
-        SSH_OPTS    = '-o StrictHostKeyChecking=no'
+        IMAGE      = 'ttl.sh/maydamv-cs411-devops:2h'
+        K8S_API    = 'https://kubernetes:6443'
+        K8S_TOKEN_ID = 'k8s-token'
+        // shared kubectl connection flags (token added per-call from creds)
+        KUBE_ARGS  = '--server=https://kubernetes:6443 --insecure-skip-tls-verify=true'
     }
 
     stages {
@@ -30,37 +29,23 @@ pipeline {
             }
         }
 
-        stage('Deploy on docker VM') {
+        stage('Deploy to Kubernetes') {
             steps {
-                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
                     sh '''
-                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
-                            docker pull '${IMAGE}'
-                            docker rm -f myapp 2>/dev/null || true
-                            docker run -d --name myapp -p '${APP_PORT}':'${APP_PORT}' '${IMAGE}'
-                        '
+                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" apply -f k8s/myapp-pod.yaml
+                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" apply -f k8s/myapp-service.yaml
                     '''
                 }
             }
         }
 
-        stage('Health check') {
+        stage('Wait for Ready') {
             steps {
-                withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CRED_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
                     sh '''
-                        ssh ${SSH_OPTS} -i "$SSH_KEY" "$SSH_USER"@${DOCKER_VM} '
-                            for i in $(seq 1 10); do
-                                if curl -fsS http://localhost:'${APP_PORT}'/ | grep -q "\\"Name\\":\\"Hello\\""; then
-                                    echo "Container is serving traffic on port '${APP_PORT}'"
-                                    exit 0
-                                fi
-                                echo "waiting for container... ($i/10)"
-                                sleep 1
-                            done
-                            echo "Container did not become healthy in time"
-                            docker logs myapp || true
-                            exit 1
-                        '
+                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" wait --for=condition=Ready pod/myapp --timeout=90s
+                        kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" get pod myapp -o wide
                     '''
                 }
             }
@@ -68,7 +53,13 @@ pipeline {
     }
 
     post {
-        success { echo "Deployed ${IMAGE} to ${DOCKER_VM}:${APP_PORT}" }
-        failure { echo "Build failed — check the stage logs above" }
+        success { echo "Pod myapp is Running and serving on :4444" }
+        failure {
+            withCredentials([string(credentialsId: env.K8S_TOKEN_ID, variable: 'K8S_TOKEN')]) {
+                sh '''
+                    kubectl ${KUBE_ARGS} --token="$K8S_TOKEN" describe pod myapp || true
+                '''
+            }
+        }
     }
 }
